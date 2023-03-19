@@ -233,6 +233,7 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--log_interval", type=int, default=10, help="Log every N steps.")
     parser.add_argument("--save_interval", type=int, default=10_000, help="Save weights every N steps.")
+    parser.add_argument("--num_class_images_save_interval", type=int, default=10_000, help="Save weights every N steps (and than save with save_interval).")
     parser.add_argument("--save_min_steps", type=int, default=0, help="Start saving weights after N steps.")
     parser.add_argument(
         "--mixed_precision",
@@ -419,7 +420,7 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
-def main(args):
+def main(args, num_class_images_value_step):
     logging_dir = Path(args.output_dir, "0", args.logging_dir)
 
     accelerator = Accelerator(
@@ -467,7 +468,7 @@ def main(args):
             class_images_dir.mkdir(parents=True, exist_ok=True)
             cur_class_images = len(list(class_images_dir.iterdir()))
 
-            if cur_class_images < args.num_class_images:
+            if cur_class_images < num_class_images_value_step:
                 torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
                 if pipeline is None:
                     pipeline = StableDiffusionPipeline.from_pretrained(
@@ -488,7 +489,7 @@ def main(args):
                     pipeline.set_progress_bar_config(disable=True)
                     pipeline.to(accelerator.device)
 
-                num_new_images = args.num_class_images - cur_class_images
+                num_new_images = num_class_images_value_step - cur_class_images
                 logger.info(f"Number of class images to sample: {num_new_images}.")
 
                 sample_dataset = PromptDataset(concept["class_prompt"], num_new_images)
@@ -597,7 +598,7 @@ def main(args):
         with_prior_preservation=args.with_prior_preservation,
         size=args.resolution,
         center_crop=args.center_crop,
-        num_class_images=args.num_class_images,
+        num_class_images=num_class_images_value_step,
         pad_tokens=args.pad_tokens,
         hflip=args.hflip,
         read_prompts_from_txts=args.read_prompts_from_txts,
@@ -713,7 +714,7 @@ def main(args):
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    def save_weights(step):
+    def save_weights(num_class_images_value, step):
         # Create the pipeline using using the trained modules and save it.
         if accelerator.is_main_process:
             if args.train_text_encoder:
@@ -736,7 +737,7 @@ def main(args):
             pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
             if is_xformers_available():
                 pipeline.enable_xformers_memory_efficient_attention()
-            save_dir = os.path.join(args.output_dir, f"{step}")
+            save_dir = os.path.join(args.output_dir, f"num_class_images_step_{num_class_images_value}", f"{step}")
             pipeline.save_pretrained(save_dir)
             with open(os.path.join(save_dir, "args.json"), "w") as f:
                 json.dump(args.__dict__, f, indent=2)
@@ -849,7 +850,7 @@ def main(args):
                 accelerator.log(logs, step=global_step)
 
             if global_step > 0 and not global_step % args.save_interval and global_step >= args.save_min_steps:
-                save_weights(global_step)
+                save_weights(num_class_images_value_step, global_step)
 
             progress_bar.update(1)
             global_step += 1
@@ -859,11 +860,21 @@ def main(args):
 
         accelerator.wait_for_everyone()
 
-    save_weights(global_step)
+    save_weights(num_class_images_value_step, global_step)
 
     accelerator.end_training()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    num_class_images_all_steps = args.num_class_images / args.num_class_images_save_interval
+
+    index = 1
+    while index <= num_class_images_all_steps:
+        num_class_images_step = index * args.num_class_images_save_interval
+        if num_class_images_step < args.num_class_images:
+            main(args, num_class_images_step)
+
+        index += 1
+
+    main(args, args.num_class_images)
